@@ -1206,6 +1206,7 @@ For understanding how specific attacks work (for verification and defense):
 For deep technical details on each security domain:
 
 - [Authentication](references/authentication.md)
+- [pg_hba.conf](references/pg-hba.md)
 - [Roles and Privileges](references/roles-and-privileges.md)
 - [Row-Level Security](references/rls.md)
 - [SECURITY DEFINER](references/security-definer.md)
@@ -1216,3 +1217,6 @@ For deep technical details on each security domain:
 - [SQL Injection](references/sql-injection.md)
 - [Filesystem and OS](references/filesystem-and-os.md)
 - [Backup Security](references/backup-security.md)
+- [postgresql.conf Security](references/postgresql-config.md)
+- [pgaudit — Audit Logging](references/pgaudit.md)
+- [Observability — Suspicious Activity Detection](references/observability.md)
