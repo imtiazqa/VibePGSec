@@ -35,6 +35,8 @@ Systematically inspect the PostgreSQL environment for security issues. Walk thro
 
 Based on audit findings (or proactively), provide specific configuration changes, SQL commands, and `pg_hba.conf` modifications to harden the environment.
 
+**When assembling multiple remediations into one migration script, never put `ALTER SYSTEM` inside a `BEGIN...COMMIT` block alongside other DDL.** `ALTER SYSTEM` cannot run inside a transaction block — Postgres aborts the transaction, and PostgreSQL silently turns the subsequent `COMMIT` into a `ROLLBACK`, discarding every other change in that transaction (role/RLS/grant fixes included) with no obvious error pointing at the real cause. Keep all `ALTER SYSTEM` statements — and the `SELECT pg_reload_conf();` that follows them — outside any transaction block, run after the transactional fixes have committed.
+
 ### ⚔️ VERIFY — Confirm Exploitability
 
 For specific findings, perform controlled tests to determine whether the vulnerability is actually exploitable in the current environment. This distinguishes theoretical risks from real threats.
@@ -109,6 +111,21 @@ WHERE rolcanlogin = true AND rolpassword IS NULL;
 
 -- Check authentication timeout
 SHOW authentication_timeout;
+
+-- Check whether the current role can read raw server files
+-- (pg_read_file requires superuser or membership in pg_read_server_files)
+SELECT rolsuper OR EXISTS (
+  SELECT 1 FROM pg_auth_members am
+  JOIN pg_roles r ON r.oid = am.roleid
+  WHERE r.rolname = 'pg_read_server_files' AND am.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+) AS can_read_server_files
+FROM pg_roles WHERE rolname = current_user;
+
+-- If can_read_server_files is true, read the RAW pg_hba.conf text.
+-- pg_hba_file_rules only shows parsed, applied rules — it silently omits
+-- comments, disabled/overridden lines, and the structure of @-included files.
+-- Reading the raw file surfaces all of that.
+SELECT pg_read_file(current_setting('hba_file'));
 ```
 
 ### Attack Reasoning
@@ -126,6 +143,12 @@ AUTHENTICATION AUDIT
    → Combined with trust auth, this is direct access: CRITICAL
 5. Check listen_addresses.
    → If '*' or '0.0.0.0' with weak auth: CRITICAL
+5a. If superuser/pg_read_server_files, read the raw pg_hba.conf via pg_read_file.
+   → Cross-check against pg_hba_file_rules: a rule present in the raw file but
+     absent from pg_hba_file_rules may be disabled (no effect) or shadowed by an
+     earlier matching line — note either as a configuration hygiene finding.
+   → Comments referencing old hosts/credentials in the raw file indicate stale
+     rules that were never cleaned up: LOW
 6. Verify SCRAM-SHA-256 is the default.
    → If not, all new passwords use weak hashing: MEDIUM
 ```
@@ -150,6 +173,8 @@ SELECT pg_reload_conf();
 
 -- Reset existing MD5 passwords to SCRAM
 -- (user must re-enter password)
+-- Run as its own statement/transaction — do NOT combine with the ALTER SYSTEM
+-- above inside one BEGIN block; ALTER SYSTEM cannot run in a transaction.
 ALTER ROLE username PASSWORD 'new_secure_password';
 ```
 
@@ -825,6 +850,18 @@ ORDER BY name;
 -- Check connection limits
 SELECT datname, datconnlimit FROM pg_database;
 SELECT rolname, rolconnlimit FROM pg_roles WHERE rolconnlimit > 0;
+
+-- If superuser or a pg_read_server_files member, read the RAW postgresql.conf text.
+-- pg_settings only shows the current EFFECTIVE value — it won't show commented-out
+-- lines, stale settings left in place, or which file last set a given value.
+SELECT pg_read_file(current_setting('config_file'));
+
+-- ALTER SYSTEM writes land in postgresql.auto.conf, layered on top of
+-- postgresql.conf — read it separately to see what's been overridden at runtime
+-- vs. what ships in the base file.
+SELECT pg_read_file(
+  (SELECT setting FROM pg_settings WHERE name = 'data_directory') || '/postgresql.auto.conf'
+);
 ```
 
 ### Recommended Security Settings
@@ -961,6 +998,10 @@ SHOW log_connections;  -- Must be 'on' to log failed auth attempts
 CREATE EXTENSION IF NOT EXISTS pgaudit;
 
 -- Configure pgaudit
+-- Run the ALTER SYSTEM statements below outside any transaction wrapping
+-- the CREATE EXTENSION above — ALTER SYSTEM cannot run in a transaction
+-- block, and combining them in one BEGIN would abort and silently roll
+-- back the extension install too.
 ALTER SYSTEM SET pgaudit.log = 'ddl, role, misc_set';
 ALTER SYSTEM SET pgaudit.log_catalog = 'on';
 ALTER SYSTEM SET pgaudit.log_parameter = 'on';
@@ -1118,7 +1159,9 @@ When asked to audit a PostgreSQL instance, follow this workflow:
    ├── Review pg_hba.conf rules
    ├── Check for trust authentication
    ├── Verify SCRAM-SHA-256 usage
-   └── Check password encryption setting
+   ├── Check password encryption setting
+   └── If privileged, read raw pg_hba.conf via pg_read_file and diff against
+       pg_hba_file_rules for disabled/shadowed/stale entries
 
 3. AUTHORIZE
    ├── Count and review superusers
@@ -1161,7 +1204,9 @@ When asked to audit a PostgreSQL instance, follow this workflow:
    ├── Review postgresql.conf security settings
    ├── Verify logging configuration
    ├── Check timeout settings
-   └── Inspect shared_preload_libraries
+   ├── Inspect shared_preload_libraries
+   └── If privileged, read raw postgresql.conf and postgresql.auto.conf via
+       pg_read_file to see commented-out settings and ALTER SYSTEM overrides
 
 10. ASSESS DATA
     ├── Find sensitive columns
